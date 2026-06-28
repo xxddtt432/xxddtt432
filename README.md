@@ -88,9 +88,8 @@ MediaVault/
 
 ## 快速开始
 1. 克隆项目到本地
-2. 使用 Visual Studio 打开 MediaFileManager.sln
-3. 还原 NuGet 包：System.Data.SQLite
-4. 编译并运行项目
+2. 使用 Visual Studio 2022 打开 MediaFileManager.sln
+3. 直接编译并运行（零外部依赖，无需 NuGet 还原）
 
 ## 项目地址
 https://github.com/xxddtt432/xxddtt432.git/
