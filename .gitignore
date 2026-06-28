@@ -1,0 +1,20 @@
+# Build outputs
+bin/
+obj/
+*.exe
+*.dll
+*.pdb
+
+# IDE
+.vs/
+*.user
+*.suo
+
+# Temp files
+*.pyc
+__pycache__/
+fix_quotes.py
+
+# OS files
+desktop.ini
+Thumbs.db

@@ -236,8 +236,7 @@ namespace MediaFileManager
             {
                 Location = new Point(78, 8),
                 Size = new Size(280, 22),
-                Font = new Font("微软雅黑", 9),
-                PlaceholderText = "输入文件/目录路径..."
+                Font = new Font("微软雅黑", 9)
             };
             txtSearch.Text = Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments);
 
@@ -409,7 +408,7 @@ namespace MediaFileManager
             // 右侧：播放信息
             lblNowPlaying = new Label
             {
-                Text = "当前未播放\n\n支持的格式：MP3, WAV, WMA, MP4, AVI, WMV\n\n请在文件浏览器中双击媒体文件\n或点击"+添加文件"添加到播放列表",
+                Text = "当前未播放\n\n支持的格式：MP3, WAV, WMA, MP4, AVI, WMV\n\n请在文件浏览器中双击媒体文件\n或点击「添加文件」添加到播放列表",
                 Location = new Point(420, 42),
                 Size = new Size(600, 400),
                 Font = new Font("微软雅黑", 10),
@@ -490,7 +489,7 @@ namespace MediaFileManager
 
             lblSyncProgress = new Label
             {
-                Text = "就绪 - 请选择源目录和目标目录后点击"开始同步"",
+                Text = "就绪 - 请选择源目录和目标目录后点击「开始同步」",
                 Location = new Point(20, yBtn + 80),
                 Size = new Size(640, 20),
                 Font = new Font("微软雅黑", 9),
@@ -561,7 +560,7 @@ namespace MediaFileManager
 
             lblSummary = new Label
             {
-                Text = "点击"刷新统计"查看文件分析报告",
+                Text = "点击「刷新统计」查看文件分析报告",
                 Location = new Point(125, 15),
                 Size = new Size(600, 24),
                 Font = new Font("微软雅黑", 10),
@@ -944,7 +943,7 @@ namespace MediaFileManager
                     .ToList();
 
                 UpdateFileList(results);
-                lblFileCount.Text = $"搜索结果: {results.Count} 个文件匹配 "{keyword}"";
+                lblFileCount.Text = $"搜索结果: {results.Count} 个文件匹配「{keyword}」";
                 lblStatus.Text = $"搜索完成 - 找到 {results.Count} 个匹配文件";
             }
             else
@@ -1187,7 +1186,7 @@ namespace MediaFileManager
 
                 if (_currentFiles.Count == 0)
                 {
-                    lblSummary.Text = "暂无文件数据，请先在"文件浏览器"中扫描目录。";
+                    lblSummary.Text = "暂无文件数据，请先在「文件浏览器」中扫描目录。";
                     return;
                 }
 

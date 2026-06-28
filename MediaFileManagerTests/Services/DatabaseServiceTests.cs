@@ -158,7 +158,7 @@ namespace MediaFileManagerTests.Services
 
             // Assert
             Assert.AreEqual(2, results.Count,
-                $"搜索"hello"应返回2个结果，实际{results.Count}个");
+                $"搜索「hello」应返回2个结果，实际{results.Count}个");
         }
 
         /// <summary>

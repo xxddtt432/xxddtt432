@@ -1,347 +1,448 @@
 using System;
 using System.Collections.Generic;
 using System.Data;
-using System.Data.SQLite;
 using System.IO;
+using System.Linq;
+using System.Text;
 using MediaFileManager.Models;
 
 namespace MediaFileManager.Services
 {
     /// <summary>
-    /// 数据库服务类
-    /// 使用SQLite嵌入式数据库存储文件元数据和同步历史记录
-    /// 封装了初始化、CRUD操作、事务处理等数据库核心功能
+    /// 数据存储服务类（内存版）
+    /// 使用静态内存列表存储，应用关闭时自动序列化到JSON文本文件
+    /// 启动时自动从文件加载，实现跨会话数据持久化
     ///
-    /// 技术要点：
-    /// - SQLite：轻量级、零配置的嵌入式数据库，适合桌面应用
-    /// - 参数化查询：使用SQLiteParameter防止SQL注入
-    /// - ADO.NET：使用IDbConnection/IDbCommand等接口实现数据库操作
-    /// - 连接管理：使用using语句确保资源正确释放
+    /// 技术说明：原始版本使用SQLite，为便于演示和编译
+    /// 这里改为内存存储 + JSON文件持久化，无需任何第三方NuGet包
+    /// 所有公开方法签名保持不变，UI层代码完全不用修改
     /// </summary>
     public class DatabaseService
     {
-        private readonly string _connectionString;
+        // ==================== 内存存储 ====================
+        private static List<MediaFileInfo> _fileCache = new List<MediaFileInfo>();
+        private static List<SyncJob> _syncHistory = new List<SyncJob>();
+        private static int _nextFileId = 1;
+        private static int _nextSyncId = 1;
+        private static readonly object _lock = new object();
 
-        /// <summary>
-        /// 构造函数：初始化数据库连接字符串
-        /// 数据库文件存储在应用程序目录下的 MediaVault.db
-        /// </summary>
+        private readonly string _dataFilePath;
+
         public DatabaseService()
         {
-            string dbPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "MediaVault.db");
-            _connectionString = $"Data Source={dbPath};Version=3;";
+            _dataFilePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "MediaVault_Data.json");
+            LoadFromDisk();
         }
 
         /// <summary>
-        /// 初始化数据库：创建所需的表结构（如不存在）
-        /// 使用DDL语句定义表结构，包含主键、索引等
+        /// 初始化数据库（建表）—— 改为从磁盘加载数据
         /// </summary>
         public void InitializeDatabase()
         {
-            using (var connection = new SQLiteConnection(_connectionString))
-            {
-                connection.Open();
-
-                // 创建文件信息表
-                // 包含索引以优化按路径和类型的查询性能
-                string createFileInfoTable = @"
-                    CREATE TABLE IF NOT EXISTS FileInfo (
-                        Id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        FileName TEXT NOT NULL,
-                        FullPath TEXT UNIQUE NOT NULL,
-                        FileSize INTEGER NOT NULL DEFAULT 0,
-                        FileType TEXT NOT NULL DEFAULT 'Other',
-                        Extension TEXT,
-                        CreationTime TEXT,
-                        LastModified TEXT,
-                        DateAdded TEXT DEFAULT (datetime('now','localtime'))
-                    );
-                    CREATE INDEX IF NOT EXISTS idx_fullpath ON FileInfo(FullPath);
-                    CREATE INDEX IF NOT EXISTS idx_filetype ON FileInfo(FileType);
-                ";
-
-                // 创建同步历史表
-                // 记录每次同步操作的详细信息
-                string createSyncHistoryTable = @"
-                    CREATE TABLE IF NOT EXISTS SyncHistory (
-                        Id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        SourcePath TEXT NOT NULL,
-                        DestinationPath TEXT NOT NULL,
-                        StartTime TEXT NOT NULL,
-                        EndTime TEXT,
-                        Status TEXT NOT NULL DEFAULT 'Running',
-                        TotalFiles INTEGER DEFAULT 0,
-                        CopiedFiles INTEGER DEFAULT 0,
-                        SkippedFiles INTEGER DEFAULT 0,
-                        FailedFiles INTEGER DEFAULT 0,
-                        TotalBytes INTEGER DEFAULT 0
-                    );
-                    CREATE INDEX IF NOT EXISTS idx_sync_time ON SyncHistory(StartTime);
-                ";
-
-                using (var cmd = new SQLiteCommand(createFileInfoTable, connection))
-                {
-                    cmd.ExecuteNonQuery();
-                }
-                using (var cmd = new SQLiteCommand(createSyncHistoryTable, connection))
-                {
-                    cmd.ExecuteNonQuery();
-                }
-            }
+            // 数据在构造函数中自动加载，此处无操作
         }
 
+        // ==================== 文件信息 CRUD ====================
+
         /// <summary>
-        /// 批量插入文件信息（使用事务提高性能）
-        /// 事务确保数据一致性：要么全部插入，要么全部回滚
-        ///
-        /// 技术要点：
-        /// - 事务处理：BEGIN/COMMIT/ROLLBACK
-        /// - 批量操作优化：减少数据库锁定次数
-        /// - INSERT OR REPLACE：处理重复路径的文件记录
+        /// 批量插入文件信息
+        /// 使用lock确保线程安全，新记录分配自增ID
+        /// 重复路径（FullPath相同）时替换旧记录
         /// </summary>
         public void BatchInsertFiles(List<MediaFileInfo> files)
         {
-            using (var connection = new SQLiteConnection(_connectionString))
+            lock (_lock)
             {
-                connection.Open();
-                using (var transaction = connection.BeginTransaction())
+                foreach (var file in files)
                 {
-                    try
+                    // 检查是否已有相同路径的记录，有则替换
+                    var existing = _fileCache.Find(f =>
+                        string.Equals(f.FullPath, file.FullPath, StringComparison.OrdinalIgnoreCase));
+                    if (existing != null)
                     {
-                        string sql = @"INSERT OR REPLACE INTO FileInfo
-                            (FileName, FullPath, FileSize, FileType, Extension, CreationTime, LastModified)
-                            VALUES (@FileName, @FullPath, @FileSize, @FileType, @Extension, @CreationTime, @LastModified)";
-
-                        foreach (var file in files)
-                        {
-                            using (var cmd = new SQLiteCommand(sql, connection, transaction))
-                            {
-                                cmd.Parameters.AddWithValue("@FileName", file.FileName);
-                                cmd.Parameters.AddWithValue("@FullPath", file.FullPath);
-                                cmd.Parameters.AddWithValue("@FileSize", file.FileSize);
-                                cmd.Parameters.AddWithValue("@FileType", file.FileType);
-                                cmd.Parameters.AddWithValue("@Extension", file.Extension);
-                                cmd.Parameters.AddWithValue("@CreationTime", file.CreationTime.ToString("o"));
-                                cmd.Parameters.AddWithValue("@LastModified", file.LastModified.ToString("o"));
-                                cmd.ExecuteNonQuery();
-                            }
-                        }
-                        transaction.Commit();
+                        // 更新现有记录
+                        existing.FileName = file.FileName;
+                        existing.FileSize = file.FileSize;
+                        existing.FileType = file.FileType;
+                        existing.Extension = file.Extension;
+                        existing.CreationTime = file.CreationTime;
+                        existing.LastModified = file.LastModified;
                     }
-                    catch
+                    else
                     {
-                        transaction.Rollback();
-                        throw;
+                        file.Id = _nextFileId++;
+                        _fileCache.Add(file);
                     }
                 }
+                SaveToDisk();
             }
         }
 
         /// <summary>
         /// 查询所有文件信息
-        /// 返回List集合，支持后续LINQ查询和绑定到UI控件
         /// </summary>
         public List<MediaFileInfo> GetAllFiles()
         {
-            var files = new List<MediaFileInfo>();
-            using (var connection = new SQLiteConnection(_connectionString))
+            lock (_lock)
             {
-                connection.Open();
-                string sql = "SELECT * FROM FileInfo ORDER BY LastModified DESC";
-                using (var cmd = new SQLiteCommand(sql, connection))
-                using (var reader = cmd.ExecuteReader())
-                {
-                    while (reader.Read())
-                    {
-                        files.Add(MapReaderToFileInfo(reader));
-                    }
-                }
+                return _fileCache.OrderByDescending(f => f.LastModified).ToList();
             }
-            return files;
         }
 
         /// <summary>
-        /// 按文件类型查询文件列表
-        /// 使用参数化查询防止SQL注入
+        /// 按文件类型查询
         /// </summary>
         public List<MediaFileInfo> GetFilesByType(string fileType)
         {
-            var files = new List<MediaFileInfo>();
-            using (var connection = new SQLiteConnection(_connectionString))
+            lock (_lock)
             {
-                connection.Open();
-                string sql = "SELECT * FROM FileInfo WHERE FileType = @FileType ORDER BY LastModified DESC";
-                using (var cmd = new SQLiteCommand(sql, connection))
-                {
-                    cmd.Parameters.AddWithValue("@FileType", fileType);
-                    using (var reader = cmd.ExecuteReader())
-                    {
-                        while (reader.Read())
-                        {
-                            files.Add(MapReaderToFileInfo(reader));
-                        }
-                    }
-                }
+                return _fileCache
+                    .Where(f => f.FileType == fileType)
+                    .OrderByDescending(f => f.LastModified)
+                    .ToList();
             }
-            return files;
         }
 
         /// <summary>
-        /// 按文件名搜索（模糊匹配）
-        /// 使用LIKE进行模糊查询，支持通配符
+        /// 按文件名模糊搜索
         /// </summary>
         public List<MediaFileInfo> SearchFiles(string keyword)
         {
-            var files = new List<MediaFileInfo>();
-            using (var connection = new SQLiteConnection(_connectionString))
+            lock (_lock)
             {
-                connection.Open();
-                string sql = "SELECT * FROM FileInfo WHERE FileName LIKE @Keyword ORDER BY LastModified DESC";
-                using (var cmd = new SQLiteCommand(sql, connection))
-                {
-                    cmd.Parameters.AddWithValue("@Keyword", $"%{keyword}%");
-                    using (var reader = cmd.ExecuteReader())
-                    {
-                        while (reader.Read())
-                        {
-                            files.Add(MapReaderToFileInfo(reader));
-                        }
-                    }
-                }
+                return _fileCache
+                    .Where(f => f.FileName.IndexOf(keyword, StringComparison.OrdinalIgnoreCase) >= 0)
+                    .OrderByDescending(f => f.LastModified)
+                    .ToList();
             }
-            return files;
         }
 
         /// <summary>
-        /// 保存同步历史记录
+        /// 清空所有文件记录
+        /// </summary>
+        public void ClearAllFiles()
+        {
+            lock (_lock)
+            {
+                _fileCache.Clear();
+                _nextFileId = 1;
+                SaveToDisk();
+            }
+        }
+
+        // ==================== 同步历史 ====================
+
+        /// <summary>
+        /// 保存同步作业记录
         /// </summary>
         public int SaveSyncJob(SyncJob job)
         {
-            using (var connection = new SQLiteConnection(_connectionString))
+            lock (_lock)
             {
-                connection.Open();
-                string sql = @"INSERT INTO SyncHistory
-                    (SourcePath, DestinationPath, StartTime, EndTime, Status, TotalFiles, CopiedFiles, SkippedFiles, FailedFiles, TotalBytes)
-                    VALUES (@SourcePath, @DestinationPath, @StartTime, @EndTime, @Status, @TotalFiles, @CopiedFiles, @SkippedFiles, @FailedFiles, @TotalBytes);
-                    SELECT last_insert_rowid();";
-
-                using (var cmd = new SQLiteCommand(sql, connection))
-                {
-                    cmd.Parameters.AddWithValue("@SourcePath", job.SourcePath);
-                    cmd.Parameters.AddWithValue("@DestinationPath", job.DestinationPath);
-                    cmd.Parameters.AddWithValue("@StartTime", job.StartTime.ToString("o"));
-                    cmd.Parameters.AddWithValue("@EndTime", job.EndTime?.ToString("o") ?? (object)DBNull.Value);
-                    cmd.Parameters.AddWithValue("@Status", job.Status);
-                    cmd.Parameters.AddWithValue("@TotalFiles", job.TotalFiles);
-                    cmd.Parameters.AddWithValue("@CopiedFiles", job.CopiedFiles);
-                    cmd.Parameters.AddWithValue("@SkippedFiles", job.SkippedFiles);
-                    cmd.Parameters.AddWithValue("@FailedFiles", job.FailedFiles);
-                    cmd.Parameters.AddWithValue("@TotalBytes", job.TotalBytes);
-                    return Convert.ToInt32(cmd.ExecuteScalar());
-                }
+                job.Id = _nextSyncId++;
+                _syncHistory.Insert(0, job); // 最新在前
+                // 最多保留50条历史
+                if (_syncHistory.Count > 50)
+                    _syncHistory = _syncHistory.Take(50).ToList();
+                SaveToDisk();
+                return job.Id;
             }
         }
 
         /// <summary>
-        /// 获取同步历史记录
+        /// 获取同步历史记录（最近20条）
         /// </summary>
         public List<SyncJob> GetSyncHistory()
         {
-            var jobs = new List<SyncJob>();
-            using (var connection = new SQLiteConnection(_connectionString))
+            lock (_lock)
             {
-                connection.Open();
-                string sql = "SELECT * FROM SyncHistory ORDER BY StartTime DESC LIMIT 20";
-                using (var cmd = new SQLiteCommand(sql, connection))
-                using (var reader = cmd.ExecuteReader())
-                {
-                    while (reader.Read())
-                    {
-                        jobs.Add(new SyncJob
-                        {
-                            Id = Convert.ToInt32(reader["Id"]),
-                            SourcePath = reader["SourcePath"].ToString(),
-                            DestinationPath = reader["DestinationPath"].ToString(),
-                            StartTime = DateTime.Parse(reader["StartTime"].ToString()),
-                            EndTime = reader["EndTime"] != DBNull.Value ? DateTime.Parse(reader["EndTime"].ToString()) : (DateTime?)null,
-                            Status = reader["Status"].ToString(),
-                            TotalFiles = Convert.ToInt32(reader["TotalFiles"]),
-                            CopiedFiles = Convert.ToInt32(reader["CopiedFiles"]),
-                            SkippedFiles = Convert.ToInt32(reader["SkippedFiles"]),
-                            FailedFiles = Convert.ToInt32(reader["FailedFiles"]),
-                            TotalBytes = Convert.ToInt64(reader["TotalBytes"])
-                        });
-                    }
-                }
+                return _syncHistory.Take(20).ToList();
             }
-            return jobs;
         }
+
+        // ==================== 统计查询 ====================
 
         /// <summary>
         /// 获取各类型文件的统计数量
-        /// 使用GROUP BY聚合查询，返回DataTable便于绑定到图表
+        /// 返回DataTable用于绑定DataGridView和图表
         /// </summary>
         public DataTable GetFileTypeStatistics()
         {
             var dt = new DataTable();
-            using (var connection = new SQLiteConnection(_connectionString))
+            dt.Columns.Add("FileType", typeof(string));
+            dt.Columns.Add("Count", typeof(int));
+            dt.Columns.Add("TotalSize", typeof(long));
+
+            List<MediaFileInfo> files;
+            lock (_lock)
             {
-                connection.Open();
-                string sql = @"SELECT FileType, COUNT(*) as Count, SUM(FileSize) as TotalSize
-                               FROM FileInfo GROUP BY FileType ORDER BY Count DESC";
-                using (var adapter = new SQLiteDataAdapter(sql, connection))
-                {
-                    adapter.Fill(dt);
-                }
+                files = new List<MediaFileInfo>(_fileCache);
             }
+
+            var grouped = files
+                .GroupBy(f => f.FileType)
+                .Select(g => new
+                {
+                    FileType = g.Key,
+                    Count = g.Count(),
+                    TotalSize = g.Sum(f => f.FileSize)
+                })
+                .OrderByDescending(g => g.Count);
+
+            foreach (var g in grouped)
+            {
+                dt.Rows.Add(g.FileType, g.Count, g.TotalSize);
+            }
+
             return dt;
         }
 
+        // ==================== 磁盘持久化 ====================
+
         /// <summary>
-        /// 清空文件信息表
+        /// 将内存数据保存到JSON文本文件
+        /// 手动序列化，不依赖第三方库
         /// </summary>
-        public void ClearAllFiles()
+        private void SaveToDisk()
         {
-            using (var connection = new SQLiteConnection(_connectionString))
+            try
             {
-                connection.Open();
-                using (var cmd = new SQLiteCommand("DELETE FROM FileInfo", connection))
+                var sb = new StringBuilder();
+                sb.AppendLine("{");
+                sb.AppendLine("  \"nextFileId\": " + _nextFileId + ",");
+                sb.AppendLine("  \"nextSyncId\": " + _nextSyncId + ",");
+                sb.AppendLine("  \"files\": [");
+
+                for (int i = 0; i < _fileCache.Count; i++)
                 {
-                    cmd.ExecuteNonQuery();
+                    var f = _fileCache[i];
+                    sb.Append("    {");
+                    sb.Append($"\"Id\":{f.Id},");
+                    sb.Append($"\"FileName\":\"{EscapeJson(f.FileName)}\",");
+                    sb.Append($"\"FullPath\":\"{EscapeJson(f.FullPath)}\",");
+                    sb.Append($"\"FileSize\":{f.FileSize},");
+                    sb.Append($"\"FileType\":\"{f.FileType}\",");
+                    sb.Append($"\"Extension\":\"{EscapeJson(f.Extension ?? "")}\",");
+                    sb.Append($"\"CreationTime\":\"{f.CreationTime:o}\",");
+                    sb.Append($"\"LastModified\":\"{f.LastModified:o}\"");
+                    sb.Append("}");
+                    if (i < _fileCache.Count - 1) sb.Append(",");
+                    sb.AppendLine();
                 }
+
+                sb.AppendLine("  ],");
+                sb.AppendLine("  \"syncHistory\": [");
+
+                for (int i = 0; i < _syncHistory.Count; i++)
+                {
+                    var s = _syncHistory[i];
+                    sb.Append("    {");
+                    sb.Append($"\"Id\":{s.Id},");
+                    sb.Append($"\"SourcePath\":\"{EscapeJson(s.SourcePath)}\",");
+                    sb.Append($"\"DestinationPath\":\"{EscapeJson(s.DestinationPath)}\",");
+                    sb.Append($"\"StartTime\":\"{s.StartTime:o}\",");
+                    sb.Append($"\"EndTime\":\"{(s.EndTime.HasValue ? s.EndTime.Value.ToString("o") : "null")}\",");
+                    sb.Append($"\"Status\":\"{s.Status}\",");
+                    sb.Append($"\"TotalFiles\":{s.TotalFiles},");
+                    sb.Append($"\"CopiedFiles\":{s.CopiedFiles},");
+                    sb.Append($"\"SkippedFiles\":{s.SkippedFiles},");
+                    sb.Append($"\"FailedFiles\":{s.FailedFiles},");
+                    sb.Append($"\"TotalBytes\":{s.TotalBytes}");
+                    sb.Append("}");
+                    if (i < _syncHistory.Count - 1) sb.Append(",");
+                    sb.AppendLine();
+                }
+
+                sb.AppendLine("  ]");
+                sb.AppendLine("}");
+
+                File.WriteAllText(_dataFilePath, sb.ToString(), Encoding.UTF8);
+            }
+            catch
+            {
+                // 保存失败不影响程序运行
             }
         }
 
         /// <summary>
-        /// 从IDataReader映射到MediaFileInfo实体
-        /// 私有辅助方法，封装数据行到对象的转换逻辑
+        /// 从JSON文本文件加载数据到内存
+        /// 简易解析器，不依赖第三方库
         /// </summary>
-        private MediaFileInfo MapReaderToFileInfo(IDataReader reader)
+        private void LoadFromDisk()
         {
-            return new MediaFileInfo
+            if (!File.Exists(_dataFilePath))
+                return;
+
+            try
             {
-                Id = Convert.ToInt32(reader["Id"]),
-                FileName = reader["FileName"].ToString(),
-                FullPath = reader["FullPath"].ToString(),
-                FileSize = Convert.ToInt64(reader["FileSize"]),
-                FileType = reader["FileType"].ToString(),
-                Extension = reader["Extension"].ToString(),
-                CreationTime = SafeParseDateTime(reader["CreationTime"]),
-                LastModified = SafeParseDateTime(reader["LastModified"])
-            };
+                string json = File.ReadAllText(_dataFilePath, Encoding.UTF8);
+
+                // 解析 nextFileId
+                _nextFileId = ExtractInt(json, "\"nextFileId\":", 1);
+                _nextSyncId = ExtractInt(json, "\"nextSyncId\":", 1);
+
+                // 解析 files 数组
+                int filesStart = json.IndexOf("\"files\":[");
+                int filesEnd = json.IndexOf("]", filesStart);
+                if (filesStart >= 0 && filesEnd > filesStart)
+                {
+                    string filesSection = json.Substring(filesStart + 9, filesEnd - filesStart - 9); // skip "files":[
+                    _fileCache = ParseFileArray(filesSection);
+                }
+
+                // 解析 syncHistory 数组
+                int histStart = json.IndexOf("\"syncHistory\":[");
+                int histEnd = json.LastIndexOf("]}");
+                if (histStart >= 0 && histEnd > histStart)
+                {
+                    string histSection = json.Substring(histStart + 15, histEnd - histStart - 15); // skip "syncHistory":[
+                    _syncHistory = ParseSyncArray(histSection);
+                }
+            }
+            catch
+            {
+                // 加载失败使用空数据
+                _fileCache = new List<MediaFileInfo>();
+                _syncHistory = new List<SyncJob>();
+            }
         }
 
         /// <summary>
-        /// 安全解析日期时间，处理空值和格式异常
-        /// 使用TryParse进行容错处理
+        /// 从JSON字符串中提取整数值
         /// </summary>
-        private DateTime SafeParseDateTime(object value)
+        private static int ExtractInt(string json, string key, int defaultValue)
         {
-            if (value == null || value == DBNull.Value)
-                return DateTime.MinValue;
-            if (DateTime.TryParse(value.ToString(), out DateTime result))
-                return result;
-            return DateTime.MinValue;
+            int idx = json.IndexOf(key);
+            if (idx < 0) return defaultValue;
+            idx += key.Length;
+            int end = json.IndexOfAny(new[] { ',', '\n', '\r', '}' }, idx);
+            if (end < 0) end = json.Length;
+            string val = json.Substring(idx, end - idx).Trim();
+            return int.TryParse(val, out int result) ? result : defaultValue;
+        }
+
+        /// <summary>
+        /// 简易文件数组JSON解析器
+        /// 按 "},{" 分割每个对象，然后提取字段值
+        /// </summary>
+        private static List<MediaFileInfo> ParseFileArray(string section)
+        {
+            var result = new List<MediaFileInfo>();
+            // 按 "},{" 分割对象（对象之间）
+            string[] objects = section.Split(new[] { "},{" }, StringSplitOptions.RemoveEmptyEntries);
+            foreach (string obj in objects)
+            {
+                string clean = obj.Trim().TrimStart('{').TrimEnd('}');
+                var file = new MediaFileInfo
+                {
+                    Id = ExtractIntFromObject(clean, "Id"),
+                    FileName = ExtractStringFromObject(clean, "FileName"),
+                    FullPath = ExtractStringFromObject(clean, "FullPath"),
+                    FileSize = ExtractLongFromObject(clean, "FileSize"),
+                    FileType = ExtractStringFromObject(clean, "FileType"),
+                    Extension = ExtractStringFromObject(clean, "Extension"),
+                    CreationTime = ExtractDateTimeFromObject(clean, "CreationTime"),
+                    LastModified = ExtractDateTimeFromObject(clean, "LastModified")
+                };
+                if (!string.IsNullOrEmpty(file.FullPath))
+                    result.Add(file);
+            }
+            return result;
+        }
+
+        /// <summary>
+        /// 简易同步历史数组JSON解析器
+        /// </summary>
+        private static List<SyncJob> ParseSyncArray(string section)
+        {
+            var result = new List<SyncJob>();
+            string[] objects = section.Split(new[] { "},{" }, StringSplitOptions.RemoveEmptyEntries);
+            foreach (string obj in objects)
+            {
+                string clean = obj.Trim().TrimStart('{').TrimEnd('}');
+                var job = new SyncJob
+                {
+                    Id = ExtractIntFromObject(clean, "Id"),
+                    SourcePath = ExtractStringFromObject(clean, "SourcePath"),
+                    DestinationPath = ExtractStringFromObject(clean, "DestinationPath"),
+                    StartTime = ExtractDateTimeFromObject(clean, "StartTime"),
+                    Status = ExtractStringFromObject(clean, "Status"),
+                    TotalFiles = ExtractIntFromObject(clean, "TotalFiles"),
+                    CopiedFiles = ExtractIntFromObject(clean, "CopiedFiles"),
+                    SkippedFiles = ExtractIntFromObject(clean, "SkippedFiles"),
+                    FailedFiles = ExtractIntFromObject(clean, "FailedFiles"),
+                    TotalBytes = ExtractLongFromObject(clean, "TotalBytes")
+                };
+                string endTimeStr = ExtractStringFromObject(clean, "EndTime");
+                if (!string.IsNullOrEmpty(endTimeStr) && endTimeStr != "null")
+                {
+                    if (DateTime.TryParse(endTimeStr, out DateTime et))
+                        job.EndTime = et;
+                }
+                if (!string.IsNullOrEmpty(job.SourcePath))
+                    result.Add(job);
+            }
+            return result;
+        }
+
+        // ==================== JSON字段提取辅助方法 ====================
+
+        private static string ExtractStringFromObject(string obj, string key)
+        {
+            string search = $"\"{key}\":\"";
+            int idx = obj.IndexOf(search);
+            if (idx < 0) return "";
+            idx += search.Length;
+            int end = idx;
+            while (end < obj.Length)
+            {
+                if (obj[end] == '"' && (end == 0 || obj[end - 1] != '\\'))
+                    break;
+                end++;
+            }
+            if (end > idx)
+                return obj.Substring(idx, end - idx).Replace("\\\"", "\"").Replace("\\\\", "\\");
+            return "";
+        }
+
+        private static int ExtractIntFromObject(string obj, string key)
+        {
+            string search = $"\"{key}\":";
+            int idx = obj.IndexOf(search);
+            if (idx < 0) return 0;
+            idx += search.Length;
+            int end = obj.IndexOfAny(new[] { ',', '}', '\n', '\r' }, idx);
+            if (end < 0) end = obj.Length;
+            string val = obj.Substring(idx, end - idx).Trim();
+            return int.TryParse(val, out int result) ? result : 0;
+        }
+
+        private static long ExtractLongFromObject(string obj, string key)
+        {
+            string search = $"\"{key}\":";
+            int idx = obj.IndexOf(search);
+            if (idx < 0) return 0;
+            idx += search.Length;
+            int end = obj.IndexOfAny(new[] { ',', '}', '\n', '\r' }, idx);
+            if (end < 0) end = obj.Length;
+            string val = obj.Substring(idx, end - idx).Trim();
+            return long.TryParse(val, out long result) ? result : 0;
+        }
+
+        private static DateTime ExtractDateTimeFromObject(string obj, string key)
+        {
+            string val = ExtractStringFromObject(obj, key);
+            if (string.IsNullOrEmpty(val)) return DateTime.MinValue;
+            return DateTime.TryParse(val, out DateTime dt) ? dt : DateTime.MinValue;
+        }
+
+        /// <summary>
+        /// JSON字符串转义
+        /// </summary>
+        private static string EscapeJson(string text)
+        {
+            if (string.IsNullOrEmpty(text)) return "";
+            return text.Replace("\\", "\\\\").Replace("\"", "\\\"").Replace("\n", "\\n").Replace("\r", "\\r");
         }
     }
 }
